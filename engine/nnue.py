@@ -67,6 +67,74 @@ def nnue_refresh_side(
 
 
 @njit(fastmath=True, nogil=True)
+def nnue_update_1add_1sub(
+        dst: np.ndarray,
+        src: np.ndarray,
+        feature_v: np.ndarray,
+        add_idx: int,
+        sub_idx: int,
+) -> None:
+    """Zero-allocation incremental accumulator update (1 add, 1 sub)."""
+    for i in range(1024):
+        val: int = int(src[i]) + int(feature_v[add_idx, i]) - int(feature_v[sub_idx, i])
+        if val > 32767:
+            val = 32767
+        elif val < -32768:
+            val = -32768
+        dst[i] = np.int16(val)
+
+
+@njit(fastmath=True, nogil=True)
+def nnue_update_1add_2sub(
+        dst: np.ndarray,
+        src: np.ndarray,
+        feature_v: np.ndarray,
+        add_idx: int,
+        sub_idx1: int,
+        sub_idx2: int,
+) -> None:
+    """Zero-allocation incremental accumulator update (1 add, 2 subs)."""
+    for i in range(1024):
+        val: int = (
+                int(src[i])
+                + int(feature_v[add_idx, i])
+                - int(feature_v[sub_idx1, i])
+                - int(feature_v[sub_idx2, i])
+        )
+        if val > 32767:
+            val = 32767
+        elif val < -32768:
+            val = -32768
+        dst[i] = np.int16(val)
+
+
+@njit(fastmath=True, nogil=True)
+def nnue_update_2add_2sub(
+        dst: np.ndarray,
+        src: np.ndarray,
+        feature_v: np.ndarray,
+        add_idx1: int,
+        add_idx2: int,
+        sub_idx1: int,
+        sub_idx2: int,
+) -> None:
+    """Zero-allocation incremental accumulator update (2 adds, 2 subs)."""
+    for i in range(1024):
+        val: int = (
+                int(src[i])
+                + int(feature_v[add_idx1, i])
+                + int(feature_v[add_idx2, i])
+                - int(feature_v[sub_idx1, i])
+                - int(feature_v[sub_idx2, i])
+        )
+        if val > 32767:
+            val = 32767
+        elif val < -32768:
+            val = -32768
+        dst[i] = np.int16(val)
+
+
+@njit(fastmath=True, nogil=True)
 def nnue_apply_update(
         dst: np.ndarray,
         src: np.ndarray,
@@ -78,15 +146,15 @@ def nnue_apply_update(
 ) -> None:
     """Incremental accumulator update (adds and subtractions)."""
     for i in range(1024):
-        val = np.int32(src[i])
+        val: int = int(src[i])
         for a in range(num_adds):
-            val += np.int32(feature_v[add_indices[a], i])
+            val += int(feature_v[add_indices[a], i])
         for s in range(num_subs):
-            val -= np.int32(feature_v[sub_indices[s], i])
-        if val > np.int32(32767):
-            val = np.int32(32767)
-        elif val < np.int32(-32768):
-            val = np.int32(-32768)
+            val -= int(feature_v[sub_indices[s], i])
+        if val > 32767:
+            val = 32767
+        elif val < -32768:
+            val = -32768
         dst[i] = np.int16(val)
 
 
@@ -101,19 +169,19 @@ def screlu_flatten(
     acc = np.int64(0)
     for i in range(1024):
         # Clipped Square ReLU on us
-        u = np.int32(us_acc[i])
-        if u < np.int32(0):
-            u = np.int32(0)
-        elif u > np.int32(255):
-            u = np.int32(255)
+        u: int = int(us_acc[i])
+        if u < 0:
+            u = 0
+        elif u > 255:
+            u = 255
         acc += np.int64(u * u) * np.int64(out_weights[i])
 
         # Clipped Square ReLU on them
-        t = np.int32(them_acc[i])
-        if t < np.int32(0):
-            t = np.int32(0)
-        elif t > np.int32(255):
-            t = np.int32(255)
+        t: int = int(them_acc[i])
+        if t < 0:
+            t = 0
+        elif t > 255:
+            t = 255
         acc += np.int64(t * t) * np.int64(out_weights[1024 + i])
 
     biased = acc + np.int64(out_bias) * QA
@@ -222,17 +290,12 @@ class NNUEState:
         w_from, b_from = feature_indices(from_piece, from_sq)
         w_to, b_to = feature_indices(to_piece, to_sq)
 
-        add_w = np.array([w_to], dtype=np.int32)
-        sub_w = np.array([w_from], dtype=np.int32)
-        add_b = np.array([b_to], dtype=np.int32)
-        sub_b = np.array([b_from], dtype=np.int32)
-
         prev = self.curr_index
         self.push()
         curr = self.curr_index
 
-        nnue_apply_update(self.white_stack[curr], self.white_stack[prev], f_w, add_w, 1, sub_w, 1)
-        nnue_apply_update(self.black_stack[curr], self.black_stack[prev], f_w, add_b, 1, sub_b, 1)
+        nnue_update_1add_1sub(self.white_stack[curr], self.white_stack[prev], f_w, w_to, w_from)
+        nnue_update_1add_1sub(self.black_stack[curr], self.black_stack[prev], f_w, b_to, b_from)
 
     def update_1add_2sub(
             self,
@@ -251,17 +314,16 @@ class NNUEState:
         w_to, b_to = feature_indices(to_piece, to_sq)
         w_cap, b_cap = feature_indices(captured_piece, captured_sq)
 
-        add_w = np.array([w_to], dtype=np.int32)
-        sub_w = np.array([w_from, w_cap], dtype=np.int32)
-        add_b = np.array([b_to], dtype=np.int32)
-        sub_b = np.array([b_from, b_cap], dtype=np.int32)
-
         prev = self.curr_index
         self.push()
         curr = self.curr_index
 
-        nnue_apply_update(self.white_stack[curr], self.white_stack[prev], f_w, add_w, 1, sub_w, 2)
-        nnue_apply_update(self.black_stack[curr], self.black_stack[prev], f_w, add_b, 1, sub_b, 2)
+        nnue_update_1add_2sub(
+            self.white_stack[curr], self.white_stack[prev], f_w, w_to, w_from, w_cap
+        )
+        nnue_update_1add_2sub(
+            self.black_stack[curr], self.black_stack[prev], f_w, b_to, b_from, b_cap
+        )
 
     def update_2add_2sub(
             self,
@@ -281,17 +343,16 @@ class NNUEState:
         wf2, bf2 = feature_indices(piece2, from2)
         wt2, bt2 = feature_indices(piece2, to2)
 
-        add_w = np.array([wt1, wt2], dtype=np.int32)
-        sub_w = np.array([wf1, wf2], dtype=np.int32)
-        add_b = np.array([bt1, bt2], dtype=np.int32)
-        sub_b = np.array([bf1, bf2], dtype=np.int32)
-
         prev = self.curr_index
         self.push()
         curr = self.curr_index
 
-        nnue_apply_update(self.white_stack[curr], self.white_stack[prev], f_w, add_w, 2, sub_w, 2)
-        nnue_apply_update(self.black_stack[curr], self.black_stack[prev], f_w, add_b, 2, sub_b, 2)
+        nnue_update_2add_2sub(
+            self.white_stack[curr], self.white_stack[prev], f_w, wt1, wt2, wf1, wf2
+        )
+        nnue_update_2add_2sub(
+            self.black_stack[curr], self.black_stack[prev], f_w, bt1, bt2, bf1, bf2
+        )
 
 
 def load_weights(path: Path) -> NNUEWeights:

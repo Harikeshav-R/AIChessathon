@@ -19,9 +19,12 @@ DIRECTIONS = [8, -8, 1, -1, 9, -7, 7, -9]
 BISHOP_DIRS = [9, -7, 7, -9]
 ROOK_DIRS = [8, -8, 1, -1]
 
+# Preallocated 8-directional Ray Masks (North, South, East, West, NE, NW, SE, SW)
+RAY_MASKS = np.zeros((8, 64), dtype=np.uint64)
+
 
 def _init_step_attacks() -> None:
-    """Precomputes non-sliding piece attacks (Pawns, Knights, Kings)."""
+    """Precomputes non-sliding and ray-sliding attack masks."""
     for sq in range(64):
         file = sq & 7
         rank = sq >> 3
@@ -66,6 +69,66 @@ def _init_step_attacks() -> None:
                 k_att |= np.uint64(1) << np.uint64(nr * 8 + nf)
         KING_ATTACKS[sq] = k_att
 
+        # North (+8)
+        m = np.uint64(0)
+        for nr in range(rank + 1, 8):
+            m |= np.uint64(1) << np.uint64(nr * 8 + file)
+        RAY_MASKS[0, sq] = m
+
+        # South (-8)
+        m = np.uint64(0)
+        for nr in range(rank - 1, -1, -1):
+            m |= np.uint64(1) << np.uint64(nr * 8 + file)
+        RAY_MASKS[1, sq] = m
+
+        # East (+1)
+        m = np.uint64(0)
+        for nf in range(file + 1, 8):
+            m |= np.uint64(1) << np.uint64(rank * 8 + nf)
+        RAY_MASKS[2, sq] = m
+
+        # West (-1)
+        m = np.uint64(0)
+        for nf in range(file - 1, -1, -1):
+            m |= np.uint64(1) << np.uint64(rank * 8 + nf)
+        RAY_MASKS[3, sq] = m
+
+        # Northeast (+9)
+        m = np.uint64(0)
+        nr, nf = rank + 1, file + 1
+        while nr <= 7 and nf <= 7:
+            m |= np.uint64(1) << np.uint64(nr * 8 + nf)
+            nr += 1
+            nf += 1
+        RAY_MASKS[4, sq] = m
+
+        # Northwest (+7)
+        m = np.uint64(0)
+        nr, nf = rank + 1, file - 1
+        while nr <= 7 and nf >= 0:
+            m |= np.uint64(1) << np.uint64(nr * 8 + nf)
+            nr += 1
+            nf -= 1
+        RAY_MASKS[5, sq] = m
+
+        # Southeast (-7)
+        m = np.uint64(0)
+        nr, nf = rank - 1, file + 1
+        while nr >= 0 and nf <= 7:
+            m |= np.uint64(1) << np.uint64(nr * 8 + nf)
+            nr -= 1
+            nf += 1
+        RAY_MASKS[6, sq] = m
+
+        # Southwest (-9)
+        m = np.uint64(0)
+        nr, nf = rank - 1, file - 1
+        while nr >= 0 and nf >= 0:
+            m |= np.uint64(1) << np.uint64(nr * 8 + nf)
+            nr -= 1
+            nf -= 1
+        RAY_MASKS[7, sq] = m
+
 
 _init_step_attacks()
 
@@ -109,6 +172,33 @@ def get_lsb(bb: np.uint64) -> int:
 
 
 @njit(inline="always")
+def get_msb(bb: np.uint64) -> int:
+    """Returns the index (0..63) of the most significant set bit (or 64 if 0)."""
+    if bb == np.uint64(0):
+        return 64
+    val = bb
+    idx = 0
+    if val > np.uint64(0xFFFFFFFF):
+        val >>= np.uint64(32)
+        idx += 32
+    if val > np.uint64(0xFFFF):
+        val >>= np.uint64(16)
+        idx += 16
+    if val > np.uint64(0xFF):
+        val >>= np.uint64(8)
+        idx += 8
+    if val > np.uint64(0xF):
+        val >>= np.uint64(4)
+        idx += 4
+    if val > np.uint64(0x3):
+        val >>= np.uint64(2)
+        idx += 2
+    if val > np.uint64(0x1):
+        idx += 1
+    return idx
+
+
+@njit(inline="always")
 def clear_lsb(bb: np.uint64) -> np.uint64:
     """Clears the least significant set bit."""
     return bb & (bb - np.uint64(1))
@@ -116,90 +206,40 @@ def clear_lsb(bb: np.uint64) -> np.uint64:
 
 @njit(fastmath=True, nogil=True)
 def get_bishop_attacks(sq: int, occ: np.uint64) -> np.uint64:
-    """Computes ray-cast bishop attacks on the fly."""
-    attacks = np.uint64(0)
-    file = sq & 7
-    rank = sq >> 3
-
-    # Northeast (+9)
-    r, f = rank + 1, file + 1
-    while r <= 7 and f <= 7:
-        target = np.uint64(1) << np.uint64(r * 8 + f)
-        attacks |= target
-        if occ & target:
-            break
-        r += 1
-        f += 1
-
-    # Northwest (+7)
-    r, f = rank + 1, file - 1
-    while r <= 7 and f >= 0:
-        target = np.uint64(1) << np.uint64(r * 8 + f)
-        attacks |= target
-        if occ & target:
-            break
-        r += 1
-        f -= 1
-
-    # Southeast (-7)
-    r, f = rank - 1, file + 1
-    while r >= 0 and f <= 7:
-        target = np.uint64(1) << np.uint64(r * 8 + f)
-        attacks |= target
-        if occ & target:
-            break
-        r -= 1
-        f += 1
-
-    # Southwest (-9)
-    r, f = rank - 1, file - 1
-    while r >= 0 and f >= 0:
-        target = np.uint64(1) << np.uint64(r * 8 + f)
-        attacks |= target
-        if occ & target:
-            break
-        r -= 1
-        f -= 1
-
-    return attacks
+    """Computes fast branchless bishop attacks using bitscan ray obstruction difference."""
+    att = np.uint64(0)
+    # Northeast (+9, positive ray)
+    b = occ & RAY_MASKS[4, sq]
+    att |= (RAY_MASKS[4, sq] ^ RAY_MASKS[4, get_lsb(b)]) if b else RAY_MASKS[4, sq]
+    # Northwest (+7, positive ray)
+    b = occ & RAY_MASKS[5, sq]
+    att |= (RAY_MASKS[5, sq] ^ RAY_MASKS[5, get_lsb(b)]) if b else RAY_MASKS[5, sq]
+    # Southeast (-7, negative ray)
+    b = occ & RAY_MASKS[6, sq]
+    att |= (RAY_MASKS[6, sq] ^ RAY_MASKS[6, get_msb(b)]) if b else RAY_MASKS[6, sq]
+    # Southwest (-9, negative ray)
+    b = occ & RAY_MASKS[7, sq]
+    att |= (RAY_MASKS[7, sq] ^ RAY_MASKS[7, get_msb(b)]) if b else RAY_MASKS[7, sq]
+    return np.uint64(att)
 
 
 @njit(fastmath=True, nogil=True)
 def get_rook_attacks(sq: int, occ: np.uint64) -> np.uint64:
-    """Computes ray-cast rook attacks on the fly."""
-    attacks = np.uint64(0)
-    file = sq & 7
-    rank = sq >> 3
-
-    # North (+8)
-    for r in range(rank + 1, 8):
-        target = np.uint64(1) << np.uint64(r * 8 + file)
-        attacks |= target
-        if occ & target:
-            break
-
-    # South (-8)
-    for r in range(rank - 1, -1, -1):
-        target = np.uint64(1) << np.uint64(r * 8 + file)
-        attacks |= target
-        if occ & target:
-            break
-
-    # East (+1)
-    for f in range(file + 1, 8):
-        target = np.uint64(1) << np.uint64(rank * 8 + f)
-        attacks |= target
-        if occ & target:
-            break
-
-    # West (-1)
-    for f in range(file - 1, -1, -1):
-        target = np.uint64(1) << np.uint64(rank * 8 + f)
-        attacks |= target
-        if occ & target:
-            break
-
-    return attacks
+    """Computes fast branchless rook attacks using bitscan ray obstruction difference."""
+    att = np.uint64(0)
+    # North (+8, positive ray)
+    b = occ & RAY_MASKS[0, sq]
+    att |= (RAY_MASKS[0, sq] ^ RAY_MASKS[0, get_lsb(b)]) if b else RAY_MASKS[0, sq]
+    # South (-8, negative ray)
+    b = occ & RAY_MASKS[1, sq]
+    att |= (RAY_MASKS[1, sq] ^ RAY_MASKS[1, get_msb(b)]) if b else RAY_MASKS[1, sq]
+    # East (+1, positive ray)
+    b = occ & RAY_MASKS[2, sq]
+    att |= (RAY_MASKS[2, sq] ^ RAY_MASKS[2, get_lsb(b)]) if b else RAY_MASKS[2, sq]
+    # West (-1, negative ray)
+    b = occ & RAY_MASKS[3, sq]
+    att |= (RAY_MASKS[3, sq] ^ RAY_MASKS[3, get_msb(b)]) if b else RAY_MASKS[3, sq]
+    return np.uint64(att)
 
 
 @njit(fastmath=True, nogil=True)

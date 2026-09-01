@@ -45,6 +45,7 @@ from engine.defs import (
     PT_BISHOP,
     PT_KING,
     PT_KNIGHT,
+    PT_NONE,
     PT_PAWN,
     PT_QUEEN,
     PT_ROOK,
@@ -52,7 +53,6 @@ from engine.defs import (
     SCORE_MATE,
     SCORE_NONE,
     SCORE_WIN,
-    SEE_VALUES,
     SIDE_INDEX,
     SIDE_KINGSIDE,
     SIDE_QUEENSIDE,
@@ -69,14 +69,21 @@ from engine.defs import (
 )
 from engine.nnue import (
     feature_indices,
-    nnue_apply_update,
+    nnue_update_1add_1sub,
+    nnue_update_1add_2sub,
+    nnue_update_2add_2sub,
     phase_to_index,
     screlu_flatten,
 )
 from engine.params import (
     CORR_WEIGHT,
+    FP_DEPTH,
+    FP_MARGIN,
     HIST_BONUS,
     HIST_MAX,
+    IIR_MIN_DEPTH,
+    LMP_BASE,
+    LMP_DEPTH,
     LMR_MIN_DEPTH,
     LMR_TABLE,
     NMP_BASE,
@@ -88,7 +95,138 @@ from engine.params import (
     SE_DEPTH,
     SE_DOUBLE_EXT_MARGIN,
     SE_TRIPLE_EXT_MARGIN,
+    SEE_PRUNING_DEPTH,
+    SEE_QUIET_MARGIN,
 )
+
+
+@njit(fastmath=True, nogil=True)
+def get_least_valuable_attacker(
+        colors_bb: np.ndarray,
+        pieces_bb: np.ndarray,
+        sq: int,
+        side: int,
+        occ: np.uint64,
+) -> tuple[int, int]:
+    """Finds square and piece type of least valuable attacker for SEE."""
+    us = colors_bb[side] & occ
+    opp = side ^ 1
+    # 1. Pawns
+    p_att = PAWN_ATTACKS[opp, sq] & pieces_bb[PT_PAWN] & us
+    if p_att:
+        from_sq = get_lsb(p_att)
+        return from_sq, PT_PAWN
+    # 2. Knights
+    n_att = KNIGHT_ATTACKS[sq] & pieces_bb[PT_KNIGHT] & us
+    if n_att:
+        from_sq = get_lsb(n_att)
+        return from_sq, PT_KNIGHT
+    # 3. Bishops
+    b_att = get_bishop_attacks(sq, occ) & pieces_bb[PT_BISHOP] & us
+    if b_att:
+        from_sq = get_lsb(b_att)
+        return from_sq, PT_BISHOP
+    # 4. Rooks
+    r_att = get_rook_attacks(sq, occ) & pieces_bb[PT_ROOK] & us
+    if r_att:
+        from_sq = get_lsb(r_att)
+        return from_sq, PT_ROOK
+    # 5. Queens
+    q_att = (get_bishop_attacks(sq, occ) | get_rook_attacks(sq, occ)) & pieces_bb[PT_QUEEN] & us
+    if q_att:
+        from_sq = get_lsb(q_att)
+        return from_sq, PT_QUEEN
+    # 6. King
+    k_att = KING_ATTACKS[sq] & pieces_bb[PT_KING] & us
+    if k_att:
+        from_sq = get_lsb(k_att)
+        return from_sq, PT_KING
+    return 64, PT_NONE
+
+
+@njit(inline="always")
+def get_see_value(pt: int) -> int:
+    p = int(pt)
+    if p == 1:
+        return 100
+    elif p == 2 or p == 3:
+        return 450
+    elif p == 4:
+        return 650
+    elif p == 5:
+        return 1250
+    elif p == 6:
+        return 10000
+    return 0
+
+
+@njit(fastmath=True, nogil=True)
+def see_fast(
+        board: np.ndarray,
+        colors_bb: np.ndarray,
+        pieces_bb: np.ndarray,
+        move: int,
+        threshold: int,
+) -> bool:
+    """Fast Static Exchange Evaluation (SEE) threshold filter."""
+    from_sq = int(extract_from(move))
+    to_sq = int(extract_to(move))
+    m_type = int(extract_type(move))
+
+    from_piece = int(board[from_sq])
+    to_piece = int(board[to_sq])
+    from_pt = int(get_piece_type(from_piece))
+    to_pt = int(get_piece_type(to_piece)) if to_piece != 0 else 0
+
+    if m_type == MOVE_CASTLING:
+        return threshold <= 0
+
+    val = 0
+    if to_pt != 0:
+        val = get_see_value(to_pt)
+    elif m_type == MOVE_EN_PASSANT:
+        val = get_see_value(1)
+
+    if m_type == MOVE_PROMOTION:
+        promo_pt = int(extract_promo(move)) + 2
+        val += get_see_value(promo_pt) - get_see_value(1)
+
+    if val < threshold:
+        return False
+
+    val -= get_see_value(from_pt)
+    if val >= threshold:
+        return True
+
+    gain = np.zeros(32, dtype=np.int32)
+    gain[0] = val + get_see_value(from_pt)
+
+    color = from_piece & 1
+    side = color ^ 1
+    occ = (colors_bb[0] | colors_bb[1]) ^ (np.uint64(1) << np.uint64(from_sq))
+
+    attacker_pt = from_pt
+    d = 1
+
+    while d < 32:
+        gain[d] = get_see_value(attacker_pt) - gain[d - 1]
+        if max(-gain[d - 1], gain[d]) < threshold:
+            break
+
+        from_sq, next_attacker_pt = get_least_valuable_attacker(colors_bb, pieces_bb, to_sq, side, occ)
+        if next_attacker_pt == 0:
+            break
+
+        attacker_pt = int(next_attacker_pt)
+        occ ^= np.uint64(1) << np.uint64(from_sq)
+        side ^= 1
+        d += 1
+
+    while d > 1:
+        d -= 1
+        gain[d - 1] = -max(-gain[d - 1], gain[d])
+
+    return bool(gain[0] >= threshold)
 
 
 @njit(fastmath=True, nogil=True)
@@ -483,13 +621,8 @@ def make_move_fast(
         wf2, bf2 = feature_indices(rook_piece, rook_from)
         wt2, bt2 = feature_indices(rook_piece, rook_to)
 
-        add_w = np.array([wt1, wt2], dtype=np.int32)
-        sub_w = np.array([wf1, wf2], dtype=np.int32)
-        add_b = np.array([bt1, bt2], dtype=np.int32)
-        sub_b = np.array([bf1, bf2], dtype=np.int32)
-
-        nnue_apply_update(white_acc_stack[dst_ply], white_acc_stack[src_ply], f_w, add_w, 2, sub_w, 2)
-        nnue_apply_update(black_acc_stack[dst_ply], black_acc_stack[src_ply], f_w, add_b, 2, sub_b, 2)
+        nnue_update_2add_2sub(white_acc_stack[dst_ply], white_acc_stack[src_ply], f_w, wt1, wt2, wf1, wf2)
+        nnue_update_2add_2sub(black_acc_stack[dst_ply], black_acc_stack[src_ply], f_w, bt1, bt2, bf1, bf2)
 
     elif captured_piece != PIECE_BLANK:
         halfmoves_stack[dst_ply] = 0
@@ -590,19 +723,11 @@ def make_move_fast(
 
         if captured_piece != PIECE_BLANK:
             w_cap, b_cap = feature_indices(captured_piece, captured_sq)
-            add_w = np.array([w_to], dtype=np.int32)
-            sub_w = np.array([w_from, w_cap], dtype=np.int32)
-            add_b = np.array([b_to], dtype=np.int32)
-            sub_b = np.array([b_from, b_cap], dtype=np.int32)
-            nnue_apply_update(white_acc_stack[dst_ply], white_acc_stack[src_ply], f_w, add_w, 1, sub_w, 2)
-            nnue_apply_update(black_acc_stack[dst_ply], black_acc_stack[src_ply], f_w, add_b, 1, sub_b, 2)
+            nnue_update_1add_2sub(white_acc_stack[dst_ply], white_acc_stack[src_ply], f_w, w_to, w_from, w_cap)
+            nnue_update_1add_2sub(black_acc_stack[dst_ply], black_acc_stack[src_ply], f_w, b_to, b_from, b_cap)
         else:
-            add_w = np.array([w_to], dtype=np.int32)
-            sub_w = np.array([w_from], dtype=np.int32)
-            add_b = np.array([b_to], dtype=np.int32)
-            sub_b = np.array([b_from], dtype=np.int32)
-            nnue_apply_update(white_acc_stack[dst_ply], white_acc_stack[src_ply], f_w, add_w, 1, sub_w, 1)
-            nnue_apply_update(black_acc_stack[dst_ply], black_acc_stack[src_ply], f_w, add_b, 1, sub_b, 1)
+            nnue_update_1add_1sub(white_acc_stack[dst_ply], white_acc_stack[src_ply], f_w, w_to, w_from)
+            nnue_update_1add_1sub(black_acc_stack[dst_ply], black_acc_stack[src_ply], f_w, b_to, b_from)
 
 
 @njit(fastmath=True, nogil=True)
@@ -639,7 +764,7 @@ def qsearch_fast(
         return eval_position_fast(
             ply, color_stack, phase_stack, material_stack, pawn_stack, non_pawn_stack,
             white_acc_stack, black_acc_stack, output_weights, output_biases,
-            pawn_corr_hist, non_pawn_corr_hist
+            pawn_corr_hist, non_pawn_corr_hist,
         )
 
     nodes_count[0] += 1
@@ -648,7 +773,7 @@ def qsearch_fast(
         return eval_position_fast(
             ply, color_stack, phase_stack, material_stack, pawn_stack, non_pawn_stack,
             white_acc_stack, black_acc_stack, output_weights, output_biases,
-            pawn_corr_hist, non_pawn_corr_hist
+            pawn_corr_hist, non_pawn_corr_hist,
         )
 
     color = int(color_stack[ply])
@@ -659,7 +784,7 @@ def qsearch_fast(
         stand_pat = eval_position_fast(
             ply, color_stack, phase_stack, material_stack, pawn_stack, non_pawn_stack,
             white_acc_stack, black_acc_stack, output_weights, output_biases,
-            pawn_corr_hist, non_pawn_corr_hist
+            pawn_corr_hist, non_pawn_corr_hist,
         )
         if stand_pat >= beta:
             return stand_pat
@@ -671,7 +796,7 @@ def qsearch_fast(
     n_moves = generate_moves_fast(
         board_stack[ply], colors_stack[ply], pieces_stack[ply],
         castling_stack[ply], int(ep_stack[ply]), color,
-        move_stack[ply], 0, gen_mode
+        move_stack[ply], 0, gen_mode,
     )
 
     # Score captures with MVV-LVA
@@ -681,8 +806,8 @@ def qsearch_fast(
         t = extract_to(m)
         f_piece = int(board_stack[ply, f])
         t_piece = int(board_stack[ply, t])
-        att_val = int(SEE_VALUES[get_piece_type(f_piece)])
-        vic_val = int(SEE_VALUES[get_piece_type(t_piece)]) if t_piece != 0 else att_val
+        att_val = get_see_value(get_piece_type(f_piece))
+        vic_val = get_see_value(get_piece_type(t_piece)) if t_piece != 0 else att_val
         score_stack[ply, i] = vic_val * 100 - att_val
 
     best_score = stand_pat if not in_chk else SCORE_NONE
@@ -697,12 +822,16 @@ def qsearch_fast(
 
         m = int(move_stack[ply, i])
 
+        # QSearch SEE Pruning: prune losing captures unless in check
+        if not in_chk and not see_fast(board_stack[ply], colors_stack[ply], pieces_stack[ply], m, 0):
+            continue
+
         next_ply = ply + 1
         make_move_fast(
             ply, next_ply, m,
             board_stack, colors_stack, pieces_stack, material_stack, castling_stack,
             ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
-            non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack, feature_weights
+            non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack, feature_weights,
         )
 
         if is_in_check_fast(colors_stack[next_ply], pieces_stack[next_ply], color):
@@ -714,7 +843,7 @@ def qsearch_fast(
             ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
             non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack,
             move_stack, score_stack, feature_weights, output_weights, output_biases,
-            pawn_corr_hist, non_pawn_corr_hist, nodes_count, stop_flag, node_limit
+            pawn_corr_hist, non_pawn_corr_hist, nodes_count, stop_flag, node_limit,
         )
 
         if stop_flag[0] != 0:
@@ -762,6 +891,8 @@ def pvs_search_fast(
         main_history: np.ndarray,
         cap_history: np.ndarray,
         cont_history_1: np.ndarray,
+        cont_history_2: np.ndarray,
+        counter_moves: np.ndarray,
         pawn_corr_hist: np.ndarray,
         non_pawn_corr_hist: np.ndarray,
         feature_weights: np.ndarray,
@@ -784,7 +915,7 @@ def pvs_search_fast(
         return eval_position_fast(
             ply, color_stack, phase_stack, material_stack, pawn_stack, non_pawn_stack,
             white_acc_stack, black_acc_stack, output_weights, output_biases,
-            pawn_corr_hist, non_pawn_corr_hist
+            pawn_corr_hist, non_pawn_corr_hist,
         )
 
     pv_length[ply] = ply
@@ -795,7 +926,7 @@ def pvs_search_fast(
             ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
             non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack,
             move_stack, score_stack, feature_weights, output_weights, output_biases,
-            pawn_corr_hist, non_pawn_corr_hist, nodes_count, stop_flag, node_limit
+            pawn_corr_hist, non_pawn_corr_hist, nodes_count, stop_flag, node_limit,
         )
 
     nodes_count[0] += 1
@@ -804,23 +935,35 @@ def pvs_search_fast(
         return eval_position_fast(
             ply, color_stack, phase_stack, material_stack, pawn_stack, non_pawn_stack,
             white_acc_stack, black_acc_stack, output_weights, output_biases,
-            pawn_corr_hist, non_pawn_corr_hist
+            pawn_corr_hist, non_pawn_corr_hist,
         )
 
     color = int(color_stack[ply])
     in_chk = is_in_check_fast(colors_stack[ply], pieces_stack[ply], color)
 
+    # Check extension
+    if in_chk:
+        depth = max(1, depth + 1)
+
     # 1. TT Probe
     z_key = zobrist_stack[ply]
     tt_idx = int(z_key & np.uint64(tt_mask))
-    key_16 = np.uint16(z_key >> np.uint64(48))
+    key_32 = np.uint32(z_key >> np.uint64(32))
 
-    tt_hit = (tt_keys[tt_idx] == key_16) and (excluded_move == MOVE_NONE)
-    tt_score = int(tt_scores[tt_idx]) if tt_hit else SCORE_NONE
+    tt_hit = (tt_keys[tt_idx] == key_32) and (excluded_move == MOVE_NONE)
+    raw_tt_score = int(tt_scores[tt_idx]) if tt_hit else SCORE_NONE
     tt_static_eval = int(tt_static_evals[tt_idx]) if tt_hit else SCORE_NONE
     tt_move = int(tt_moves[tt_idx]) if tt_hit else MOVE_NONE
     tt_depth = int(tt_depths[tt_idx]) if tt_hit else 0
     tt_bound = int(tt_bounds[tt_idx]) if tt_hit else ENTRY_NONE
+
+    # Mate score ply adjustment on TT hit
+    tt_score = raw_tt_score
+    if tt_hit and raw_tt_score != SCORE_NONE:
+        if raw_tt_score >= SCORE_WIN:
+            tt_score = raw_tt_score - ply
+        elif raw_tt_score <= SCORE_LOST:
+            tt_score = raw_tt_score + ply
 
     if (
             tt_hit
@@ -840,7 +983,7 @@ def pvs_search_fast(
         else eval_position_fast(
             ply, color_stack, phase_stack, material_stack, pawn_stack, non_pawn_stack,
             white_acc_stack, black_acc_stack, output_weights, output_biases,
-            pawn_corr_hist, non_pawn_corr_hist
+            pawn_corr_hist, non_pawn_corr_hist,
         )
     )
 
@@ -869,7 +1012,7 @@ def pvs_search_fast(
             ply, next_ply, MOVE_NONE,
             board_stack, colors_stack, pieces_stack, material_stack, castling_stack,
             ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
-            non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack, feature_weights
+            non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack, feature_weights,
         )
 
         null_score = -pvs_search_fast(
@@ -878,53 +1021,66 @@ def pvs_search_fast(
             ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
             non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack,
             move_stack, score_stack, pv_table, pv_length, killers,
-            main_history, cap_history, cont_history_1,
+            main_history, cap_history, cont_history_1, cont_history_2, counter_moves,
             pawn_corr_hist, non_pawn_corr_hist,
             feature_weights, output_weights, output_biases,
             tt_keys, tt_scores, tt_static_evals, tt_moves, tt_depths, tt_bounds, tt_ages,
-            tt_mask, current_age, nodes_count, stop_flag, node_limit
+            tt_mask, current_age, nodes_count, stop_flag, node_limit,
         )
         if null_score >= beta:
             return beta if null_score >= SCORE_WIN else null_score
+
+    # Internal Iterative Reductions (IIR)
+    if depth >= IIR_MIN_DEPTH and tt_move == MOVE_NONE and not in_chk:
+        depth -= 1
 
     # 4. Generate & Score Moves
     n_moves = generate_moves_fast(
         board_stack[ply], colors_stack[ply], pieces_stack[ply],
         castling_stack[ply], int(ep_stack[ply]), color,
-        move_stack[ply], 0, 0
+        move_stack[ply], 0, 0,
     )
 
     k1 = int(killers[ply, 0])
     k2 = int(killers[ply, 1])
+    cm = int(counter_moves[color, extract_from(tt_move), extract_to(tt_move)]) if tt_move != MOVE_NONE else MOVE_NONE
 
     for i in range(n_moves):
         m = int(move_stack[ply, i])
+        f = extract_from(m)
+        t = extract_to(m)
+        f_piece = int(board_stack[ply, f])
+        t_piece = int(board_stack[ply, t])
+        is_capture = (t_piece != 0) or (extract_type(m) == MOVE_EN_PASSANT)
+
         if m == tt_move:
             score_stack[ply, i] = 1000000000
         elif extract_type(m) == MOVE_PROMOTION and extract_promo(m) == PROMO_QUEEN:
             score_stack[ply, i] = 900000000
-        elif board_stack[ply, extract_to(m)] != PIECE_BLANK or extract_type(m) == MOVE_EN_PASSANT:
-            f = extract_from(m)
-            t = extract_to(m)
-            f_piece = int(board_stack[ply, f])
-            t_piece = int(board_stack[ply, t])
-            att_val = int(SEE_VALUES[get_piece_type(f_piece)])
-            vic_val = int(SEE_VALUES[get_piece_type(t_piece)]) if t_piece != 0 else att_val
-            score_stack[ply, i] = 800000000 + vic_val * 100 - att_val + int(cap_history[f_piece, t])
+        elif is_capture:
+            att_val = get_see_value(get_piece_type(f_piece))
+            vic_val = get_see_value(get_piece_type(t_piece)) if t_piece != 0 else att_val
+            cap_h = int(cap_history[f_piece, t])
+            if see_fast(board_stack[ply], colors_stack[ply], pieces_stack[ply], m, 0):
+                score_stack[ply, i] = 800000000 + vic_val * 100 - att_val + cap_h
+            else:
+                score_stack[ply, i] = -100000000 + vic_val * 100 - att_val + cap_h
         elif m == k1:
             score_stack[ply, i] = 700000000
         elif m == k2:
             score_stack[ply, i] = 690000000
+        elif m == cm:
+            score_stack[ply, i] = 680000000
         else:
-            f = extract_from(m)
-            t = extract_to(m)
-            f_piece = int(board_stack[ply, f])
-            h = int(main_history[color, f, t]) + int(cont_history_1[f_piece, t])
+            h = int(main_history[color, f, t]) + int(cont_history_1[f_piece, t]) + int(cont_history_2[f_piece, t])
             score_stack[ply, i] = h
 
     best_score = SCORE_NONE
     best_move = MOVE_NONE
     moves_played = 0
+    quiets_played = 0
+    searched_quiets = np.zeros(64, dtype=np.uint16)
+    num_searched_quiets = 0
 
     for i in range(n_moves):
         best_i = i
@@ -938,19 +1094,55 @@ def pvs_search_fast(
         if m == excluded_move:
             continue
 
+        is_quiet = (extract_type(m) == MOVE_NORMAL) and (board_stack[ply, extract_to(m)] == 0)
+
+        # Futility Pruning (FP)
+        if (
+                depth <= FP_DEPTH
+                and not is_pv
+                and not in_chk
+                and is_quiet
+                and moves_played > 0
+                and static_eval + FP_MARGIN * depth <= alpha
+        ):
+            continue
+
+        # Late Move Pruning (LMP)
+        if (
+                depth <= LMP_DEPTH
+                and not is_pv
+                and not in_chk
+                and is_quiet
+                and quiets_played >= LMP_BASE + depth * depth
+        ):
+            continue
+
+        # SEE Pruning in PVS
+        if (
+                depth <= SEE_PRUNING_DEPTH
+                and not in_chk
+                and is_quiet
+                and not see_fast(board_stack[ply], colors_stack[ply], pieces_stack[ply], m, SEE_QUIET_MARGIN * depth)
+        ):
+            continue
+
         next_ply = ply + 1
         make_move_fast(
             ply, next_ply, m,
             board_stack, colors_stack, pieces_stack, material_stack, castling_stack,
             ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
-            non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack, feature_weights
+            non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack, feature_weights,
         )
 
         if is_in_check_fast(colors_stack[next_ply], pieces_stack[next_ply], color):
             continue
 
         moves_played += 1
-        is_quiet = (extract_type(m) == MOVE_NORMAL) and (board_stack[ply, extract_to(m)] == 0)
+        if is_quiet:
+            quiets_played += 1
+            if num_searched_quiets < 64:
+                searched_quiets[num_searched_quiets] = np.uint16(m)
+                num_searched_quiets += 1
 
         # 5. Singular Extensions
         extension = 0
@@ -969,11 +1161,11 @@ def pvs_search_fast(
                 ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
                 non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack,
                 move_stack, score_stack, pv_table, pv_length, killers,
-                main_history, cap_history, cont_history_1,
+                main_history, cap_history, cont_history_1, cont_history_2, counter_moves,
                 pawn_corr_hist, non_pawn_corr_hist,
                 feature_weights, output_weights, output_biases,
                 tt_keys, tt_scores, tt_static_evals, tt_moves, tt_depths, tt_bounds, tt_ages,
-                tt_mask, current_age, nodes_count, stop_flag, node_limit
+                tt_mask, current_age, nodes_count, stop_flag, node_limit,
             )
             if se_score < se_beta:
                 if se_score < se_beta - SE_TRIPLE_EXT_MARGIN:
@@ -1003,11 +1195,11 @@ def pvs_search_fast(
                 ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
                 non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack,
                 move_stack, score_stack, pv_table, pv_length, killers,
-                main_history, cap_history, cont_history_1,
+                main_history, cap_history, cont_history_1, cont_history_2, counter_moves,
                 pawn_corr_hist, non_pawn_corr_hist,
                 feature_weights, output_weights, output_biases,
                 tt_keys, tt_scores, tt_static_evals, tt_moves, tt_depths, tt_bounds, tt_ages,
-                tt_mask, current_age, nodes_count, stop_flag, node_limit
+                tt_mask, current_age, nodes_count, stop_flag, node_limit,
             )
         else:
             score = -pvs_search_fast(
@@ -1016,11 +1208,11 @@ def pvs_search_fast(
                 ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
                 non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack,
                 move_stack, score_stack, pv_table, pv_length, killers,
-                main_history, cap_history, cont_history_1,
+                main_history, cap_history, cont_history_1, cont_history_2, counter_moves,
                 pawn_corr_hist, non_pawn_corr_hist,
                 feature_weights, output_weights, output_biases,
                 tt_keys, tt_scores, tt_static_evals, tt_moves, tt_depths, tt_bounds, tt_ages,
-                tt_mask, current_age, nodes_count, stop_flag, node_limit
+                tt_mask, current_age, nodes_count, stop_flag, node_limit,
             )
             if score > alpha and reduction > 0:
                 score = -pvs_search_fast(
@@ -1029,11 +1221,11 @@ def pvs_search_fast(
                     ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
                     non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack,
                     move_stack, score_stack, pv_table, pv_length, killers,
-                    main_history, cap_history, cont_history_1,
+                    main_history, cap_history, cont_history_1, cont_history_2, counter_moves,
                     pawn_corr_hist, non_pawn_corr_hist,
                     feature_weights, output_weights, output_biases,
                     tt_keys, tt_scores, tt_static_evals, tt_moves, tt_depths, tt_bounds, tt_ages,
-                    tt_mask, current_age, nodes_count, stop_flag, node_limit
+                    tt_mask, current_age, nodes_count, stop_flag, node_limit,
                 )
             if alpha < score < beta:
                 score = -pvs_search_fast(
@@ -1042,11 +1234,11 @@ def pvs_search_fast(
                     ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
                     non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack,
                     move_stack, score_stack, pv_table, pv_length, killers,
-                    main_history, cap_history, cont_history_1,
+                    main_history, cap_history, cont_history_1, cont_history_2, counter_moves,
                     pawn_corr_hist, non_pawn_corr_hist,
                     feature_weights, output_weights, output_biases,
                     tt_keys, tt_scores, tt_static_evals, tt_moves, tt_depths, tt_bounds, tt_ages,
-                    tt_mask, current_age, nodes_count, stop_flag, node_limit
+                    tt_mask, current_age, nodes_count, stop_flag, node_limit,
                 )
 
         if stop_flag[0] != 0:
@@ -1072,10 +1264,28 @@ def pvs_search_fast(
                         t = extract_to(m)
                         f_piece = int(board_stack[ply, f])
                         bonus = min(HIST_MAX, HIST_BONUS * depth)
+
                         new_h = int(main_history[color, f, t]) + bonus
                         main_history[color, f, t] = np.int16(max(-32768, min(32767, new_h)))
                         new_c = int(cont_history_1[f_piece, t]) + bonus
                         cont_history_1[f_piece, t] = np.int16(max(-32768, min(32767, new_c)))
+                        new_c2 = int(cont_history_2[f_piece, t]) + bonus
+                        cont_history_2[f_piece, t] = np.int16(max(-32768, min(32767, new_c2)))
+
+                        counter_moves[color, f, t] = np.uint16(m)
+
+                        # History Malus on previously searched quiets that failed low
+                        for q_idx in range(num_searched_quiets - 1):
+                            prev_q = int(searched_quiets[q_idx])
+                            pf = extract_from(prev_q)
+                            pt = extract_to(prev_q)
+                            pp = int(board_stack[ply, pf])
+                            malus_h = int(main_history[color, pf, pt]) - bonus
+                            main_history[color, pf, pt] = np.int16(max(-32768, min(32767, malus_h)))
+                            malus_c = int(cont_history_1[pp, pt]) - bonus
+                            cont_history_1[pp, pt] = np.int16(max(-32768, min(32767, malus_c)))
+                            malus_c2 = int(cont_history_2[pp, pt]) - bonus
+                            cont_history_2[pp, pt] = np.int16(max(-32768, min(32767, malus_c2)))
                     break
 
     if moves_played == 0:
@@ -1087,9 +1297,16 @@ def pvs_search_fast(
     elif best_score <= alpha:
         bound = ENTRY_UBOUND
 
-    if tt_keys[tt_idx] != key_16 or depth >= int(tt_depths[tt_idx]):
-        tt_keys[tt_idx] = key_16
-        tt_scores[tt_idx] = np.int16(max(-32000, min(32000, best_score)))
+    # Mate score ply adjustment for TT storage
+    stored_score = best_score
+    if stored_score >= SCORE_WIN:
+        stored_score += ply
+    elif stored_score <= SCORE_LOST:
+        stored_score -= ply
+
+    if tt_keys[tt_idx] != key_32 or depth >= int(tt_depths[tt_idx]):
+        tt_keys[tt_idx] = key_32
+        tt_scores[tt_idx] = np.int16(max(-32000, min(32000, stored_score)))
         tt_static_evals[tt_idx] = np.int16(max(-32000, min(32000, static_eval)))
         if best_move != MOVE_NONE:
             tt_moves[tt_idx] = np.uint16(best_move)

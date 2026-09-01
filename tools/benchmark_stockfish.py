@@ -111,7 +111,18 @@ def play_single_game(
             board.push(move)
         else:
             t0 = time.perf_counter()
-            result = stockfish_engine.play(board, sf_limit)
+            if sf_limit.depth is not None:
+                curr_limit = sf_limit
+            else:
+                w_clock = (engine_clock if engine_is_white else sf_clock) / 1000.0
+                b_clock = (sf_clock if engine_is_white else engine_clock) / 1000.0
+                curr_limit = chess.engine.Limit(
+                    white_clock=max(0.01, w_clock),
+                    black_clock=max(0.01, b_clock),
+                    white_inc=inc_time_ms / 1000.0,
+                    black_inc=inc_time_ms / 1000.0,
+                )
+            result = stockfish_engine.play(board, curr_limit)
             elapsed = (time.perf_counter() - t0) * 1000.0
             sf_clock = sf_clock - elapsed + inc_time_ms
             sf_time_used += elapsed / 1000.0
@@ -196,11 +207,9 @@ def run_benchmark(
         config_desc = f"Stockfish (Depth {target_depth})"
     elif target_elo is not None:
         sf_engine.configure({"UCI_LimitStrength": True, "UCI_Elo": target_elo})
-        sf_limit.time = 0.5
         config_desc = f"Stockfish (Elo {target_elo})"
     elif target_skill is not None:
         sf_engine.configure({"Skill Level": target_skill})
-        sf_limit.time = 0.5
         config_desc = f"Stockfish (Skill Level {target_skill})"
     else:
         sf_limit.depth = 6
@@ -298,6 +307,12 @@ def main() -> None:
         help="Comma-separated depths to sweep (e.g. 2,4,6,8,10)",
     )
     parser.add_argument(
+        "--sweep-elos",
+        type=str,
+        default=None,
+        help="Comma-separated UCI Elo levels to sweep (e.g. 1500,1800,2000,2200)",
+    )
+    parser.add_argument(
         "--openings", type=int, default=5, help="Number of openings (each played twice)"
     )
     parser.add_argument("--base-ms", type=int, default=5000, help="Base time per game in ms")
@@ -330,6 +345,32 @@ def main() -> None:
             diff_str = f"{r['elo_diff']:>+6.1f} ± {r['error']:.0f}"
             print(
                 f"{r['config']:<28} | {score_str:<10} | {r['score_pct']:>6.1f}%   | {diff_str}"
+            )
+        print("=======================================================\n")
+    elif args.sweep_elos:
+        elos = [int(e.strip()) for e in args.sweep_elos.split(",")]
+        summary_results = []
+        for e in elos:
+            res = run_benchmark(
+                stockfish_path=sf_path,
+                target_elo=e,
+                base_time_ms=args.base_ms,
+                inc_time_ms=args.inc_ms,
+                max_openings=args.openings,
+            )
+            summary_results.append(res)
+
+        print("\n=======================================================")
+        print("                 BENCHMARK SUMMARY TABLE                ")
+        print("=======================================================")
+        print(f"{'Opponent':<28} | {'Score':<10} | {'Win Rate':<10} | {'Elo Diff':<12} | {'Estimated Elo':<14}")
+        print("-" * 84)
+        for idx, r in enumerate(summary_results):
+            score_str = f"+{r['wins']} ={r['draws']} -{r['losses']}"
+            diff_str = f"{r['elo_diff']:>+6.1f} ± {r['error']:.0f}"
+            est_elo = elos[idx] + r['elo_diff']
+            print(
+                f"{r['config']:<28} | {score_str:<10} | {r['score_pct']:>6.1f}%   | {diff_str} | ~{est_elo:.0f} Elo"
             )
         print("=======================================================\n")
     else:

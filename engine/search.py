@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import time
+from typing import Any
 
 import numpy as np
 
@@ -81,13 +82,15 @@ class EngineSearch:
         self.main_history = np.zeros((2, 64, 64), dtype=np.int16)
         self.cap_history = np.zeros((14, 64), dtype=np.int16)
         self.cont_history_1 = np.zeros((14, 64), dtype=np.int16)
+        self.cont_history_2 = np.zeros((14, 64), dtype=np.int16)
+        self.counter_moves = np.zeros((2, 64, 64), dtype=np.uint16)
         self.pawn_corr_hist = np.zeros((2, 16384), dtype=np.int16)
         self.non_pawn_corr_hist = np.zeros((2, 2, 16384), dtype=np.int16)
 
         # Transposition Table
         self.tt_size = TT_SIZE
         self.tt_mask = TT_SIZE - 1
-        self.tt_keys = np.zeros(TT_SIZE, dtype=np.uint16)
+        self.tt_keys = np.zeros(TT_SIZE, dtype=np.uint32)
         self.tt_scores = np.zeros(TT_SIZE, dtype=np.int16)
         self.tt_static_evals = np.zeros(TT_SIZE, dtype=np.int16)
         self.tt_moves = np.zeros(TT_SIZE, dtype=np.uint16)
@@ -188,15 +191,18 @@ class EngineSearch:
         stability = 0
         prev_score = 0
         predicted_reply: str | None = None
+        est_nps = 300000.0
 
         # Iterative Deepening
         for depth in range(1, MAX_SEARCH_DEPTH):
             self.current_iter = depth
 
-            # Hard node limit based on remaining time budget
+            # Hard node limit based on dynamic NPS and remaining time budget
             elapsed_ms = (time.perf_counter() - self.start_time) * 1000.0
+            if elapsed_ms > 10.0 and self.nodes_count[0] > 1000:
+                est_nps = (float(self.nodes_count[0]) / elapsed_ms) * 1000.0
             rem_ms = max(5.0, self.hard_time_limit - elapsed_ms)
-            node_limit = int(self.nodes_count[0] + rem_ms * 280.0)
+            node_limit = int(self.nodes_count[0] + (rem_ms * est_nps / 1000.0))
 
             # Aspiration Window
             if depth >= 5:
@@ -233,6 +239,8 @@ class EngineSearch:
                     self.main_history,
                     self.cap_history,
                     self.cont_history_1,
+                    self.cont_history_2,
+                    self.counter_moves,
                     self.pawn_corr_hist,
                     self.non_pawn_corr_hist,
                     self.weights.feature_weights,
@@ -286,6 +294,8 @@ class EngineSearch:
                         self.main_history,
                         self.cap_history,
                         self.cont_history_1,
+                        self.cont_history_2,
+                        self.counter_moves,
                         self.pawn_corr_hist,
                         self.non_pawn_corr_hist,
                         self.weights.feature_weights,
@@ -337,6 +347,8 @@ class EngineSearch:
                     self.main_history,
                     self.cap_history,
                     self.cont_history_1,
+                    self.cont_history_2,
+                    self.counter_moves,
                     self.pawn_corr_hist,
                     self.non_pawn_corr_hist,
                     self.weights.feature_weights,
@@ -390,6 +402,76 @@ class EngineSearch:
                 break
 
         return move_to_uci(best_move), predicted_reply
+
+    def search_ponder(self, fen: str, stop_event: Any) -> None:
+        """Background pondering search to populate TT and history tables during opponent turn."""
+        pos = self.setup_root_position(fen)
+        self.stop_flag[0] = 0
+        self.nodes_count[0] = 0
+        self.pv_table.fill(0)
+        self.pv_length.fill(0)
+
+        all_legal = legal_moves(pos)
+        if not all_legal:
+            return
+
+        for depth in range(1, 30):
+            if stop_event.is_set():
+                break
+
+            node_limit = int(self.nodes_count[0] + 50000)
+            pvs_search_fast(
+                SCORE_LOST,
+                SCORE_WIN,
+                depth,
+                0,
+                True,
+                False,
+                MOVE_NONE,
+                self.board_stack,
+                self.colors_stack,
+                self.pieces_stack,
+                self.material_stack,
+                self.castling_stack,
+                self.ep_stack,
+                self.color_stack,
+                self.halfmoves_stack,
+                self.zobrist_stack,
+                self.pawn_stack,
+                self.non_pawn_stack,
+                self.phase_stack,
+                self.white_acc_stack,
+                self.black_acc_stack,
+                self.move_stack,
+                self.score_stack,
+                self.pv_table,
+                self.pv_length,
+                self.killers,
+                self.main_history,
+                self.cap_history,
+                self.cont_history_1,
+                self.cont_history_2,
+                self.counter_moves,
+                self.pawn_corr_hist,
+                self.non_pawn_corr_hist,
+                self.weights.feature_weights,
+                self.weights.output_weights,
+                self.weights.output_biases,
+                self.tt_keys,
+                self.tt_scores,
+                self.tt_static_evals,
+                self.tt_moves,
+                self.tt_depths,
+                self.tt_bounds,
+                self.tt_ages,
+                self.tt_mask,
+                self.age,
+                self.nodes_count,
+                self.stop_flag,
+                node_limit,
+            )
+            if self.stop_flag[0] != 0:
+                self.stop_flag[0] = 0
 
     def warmup(self) -> None:
         """Warms up all Numba JIT search code paths during the 60s init window."""
