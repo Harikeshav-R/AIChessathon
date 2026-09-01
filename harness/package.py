@@ -1,3 +1,7 @@
+"""Packages tournament submission into submission.zip."""
+
+from __future__ import annotations
+
 import argparse
 import zipfile
 from collections.abc import Iterator
@@ -5,26 +9,30 @@ from pathlib import Path
 
 from harness.rules import MAX_UNZIPPED_BYTES
 
-DEFAULT_INCLUDES = ("weights",)
+DEFAULT_INCLUDES = ("weights", "engine", "assets")
 SKIP = {"__pycache__", ".DS_Store"}
 
 
 def members(root: Path, includes: tuple[str, ...]) -> Iterator[tuple[Path, str]]:
-    named: set[str] = set()
+    seen_relative: set[str] = set()
     for path in sorted(root.glob("*.py")):
-        named.add(path.name)
-        yield path, path.name
+        if path.name != "convert_starter_weights.py" and path.name not in seen_relative:
+            seen_relative.add(path.name)
+            yield path, path.name
     for name in includes:
-        if name in named:
-            continue
         source = root / name
         if source.is_file():
-            named.add(name)
-            yield source, name
+            rel = str(source.relative_to(root))
+            if rel not in seen_relative:
+                seen_relative.add(rel)
+                yield source, rel
         elif source.is_dir():
             for path in sorted(source.rglob("*")):
                 if path.is_file() and not SKIP & set(path.parts):
-                    yield path, str(path.relative_to(root))
+                    rel = str(path.relative_to(root))
+                    if rel not in seen_relative:
+                        seen_relative.add(rel)
+                        yield path, rel
 
 
 def build(root: Path, destination: Path, includes: tuple[str, ...]) -> list[str]:
