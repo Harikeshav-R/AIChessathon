@@ -39,21 +39,27 @@ def get_move(fen: str, time_left_ms: int) -> str:
     time_left_ms  your clock before this move, in milliseconds
     returns       "e2e4", or "e7e8q" for a promotion
     """
-    # 1. Stop background ponder thread if active
-    ponderer.stop()
+    try:
+        # 1. Stop background ponder thread if active
+        ponderer.stop()
 
-    # 2. Check opening book for instant theory moves
-    if book is not None:
-        book_move = book.probe(fen)
-        if book_move is not None:
-            ponderer.start_ponder(fen, book_move)
-            return book_move
+        # 2. Check opening book for instant theory moves
+        if book is not None:
+            book_move = book.probe(fen)
+            if book_move is not None:
+                ponderer.start_ponder(fen, book_move)
+                return book_move
 
-    # 3. Perform alpha-beta PVS search with dynamic time management
-    best_move_uci, predicted_reply = searcher.search_root(fen, time_left_ms)
+        # 3. Perform alpha-beta PVS search with dynamic time management
+        best_move_uci, predicted_reply = searcher.search_root(fen, time_left_ms)
 
-    # 4. Start background pondering on predicted opponent reply
-    if predicted_reply is not None:
-        ponderer.start_ponder(fen, best_move_uci, predicted_reply)
+        # 4. Start background pondering on predicted opponent reply
+        if predicted_reply is not None:
+            ponderer.start_ponder(fen, best_move_uci, predicted_reply)
 
-    return best_move_uci
+        return best_move_uci
+    except Exception:
+        import chess
+        board = chess.Board(fen)
+        legal = list(board.legal_moves)
+        return legal[0].uci() if legal else "0000"

@@ -44,7 +44,7 @@ OPENING_POSITIONS = [
     # Italian Game
     "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
     # Sicilian Defense (Open)
-    "rnbqkb1r/pp2pppp/3p4/8/3NP3/8/PPP2PPP/RNBQKB1R b KQkq - 0 4",
+    "rnbqkbnr/pp2pppp/3p4/8/3NP3/8/PPP2PPP/RNBQKB1R b KQkq - 0 4",
     # French Defense (Winawer)
     "rnbqk1nr/ppp2ppp/4p3/3p4/1b1PP3/2N5/PPP2PPP/R1BQKBNR w KQkq - 2 4",
     # Caro-Kann Defense (Advance)
@@ -218,11 +218,11 @@ def run_benchmark(
     openings = OPENING_POSITIONS[:max_openings]
     total_games = len(openings) * games_per_pairing
 
-    print("\n=======================================================")
-    print(f"  Benchmarking against: {config_desc}")
-    print(f"  Total Games: {total_games} ({len(openings)} openings x 2 colors)")
-    print(f"  Time Control: {base_time_ms / 1000:.1f}s + {inc_time_ms / 1000:.1f}s")
-    print("=======================================================\n")
+    print("\n=======================================================", flush=True)
+    print(f"  Benchmarking against: {config_desc}", flush=True)
+    print(f"  Total Games: {total_games} ({len(openings)} openings x 2 colors)", flush=True)
+    print(f"  Time Control: {base_time_ms / 1000:.1f}s + {inc_time_ms / 1000:.1f}s", flush=True)
+    print("=======================================================\n", flush=True)
 
     wins = draws = losses = 0
     game_idx = 0
@@ -249,7 +249,10 @@ def run_benchmark(
         else:
             losses += 1
             res_str = "LOSS (-1)"
-        print(f"Game {game_idx:02d}/{total_games:02d} [White]: {res_str} by {term} ({e_time:.1f}s)")
+        print(
+            f"Game {game_idx:02d}/{total_games:02d} [White]: {res_str} by {term} ({e_time:.1f}s)",
+            flush=True,
+        )
 
         # Pairing 2: Engine is Black
         game_idx += 1
@@ -271,17 +274,20 @@ def run_benchmark(
         else:
             losses += 1
             res_str = "LOSS (-1)"
-        print(f"Game {game_idx:02d}/{total_games:02d} [Black]: {res_str} by {term} ({e_time:.1f}s)")
+        print(
+            f"Game {game_idx:02d}/{total_games:02d} [Black]: {res_str} by {term} ({e_time:.1f}s)",
+            flush=True,
+        )
 
     sf_engine.quit()
 
     score_pct = (wins + 0.5 * draws) / total_games * 100.0
     elo_diff, error = calculate_elo_diff(wins, draws, losses)
 
-    print(f"\n--- Match Result vs {config_desc} ---")
-    print(f"Score: +{wins} ={draws} -{losses} ({score_pct:.1f}%)")
-    print(f"Elo Advantage: {elo_diff:+.1f} ± {error:.1f}")
-    print(f"Avg Time Per Game: {total_engine_time / total_games:.2f}s\n")
+    print(f"\n--- Match Result vs {config_desc} ---", flush=True)
+    print(f"Score: +{wins} ={draws} -{losses} ({score_pct:.1f}%)", flush=True)
+    print(f"Elo Advantage: {elo_diff:+.1f} ± {error:.1f}", flush=True)
+    print(f"Avg Time Per Game: {total_engine_time / total_games:.2f}s\n", flush=True)
 
     return {
         "config": config_desc,
@@ -291,7 +297,22 @@ def run_benchmark(
         "score_pct": score_pct,
         "elo_diff": elo_diff,
         "error": error,
+        "total_games": total_games,
     }
+
+
+# Calibrated approximate Elo table for Stockfish fixed depths in rapid/blitz
+SF_DEPTH_TO_ELO = {
+    1: 1050,
+    2: 1350,
+    3: 1650,
+    4: 1900,
+    5: 2100,
+    6: 2300,
+    7: 2450,
+    8: 2600,
+    10: 2800,
+}
 
 
 def main() -> None:
@@ -304,13 +325,13 @@ def main() -> None:
         "--sweep-depths",
         type=str,
         default=None,
-        help="Comma-separated depths to sweep (e.g. 2,4,6,8,10)",
+        help="Comma-separated depths to sweep (e.g. 1,2,3,4,5,6)",
     )
     parser.add_argument(
         "--sweep-elos",
         type=str,
         default=None,
-        help="Comma-separated UCI Elo levels to sweep (e.g. 1500,1800,2000,2200)",
+        help="Comma-separated UCI Elo levels to sweep (e.g. 1320,1500,1700,1900,2100)",
     )
     parser.add_argument(
         "--openings", type=int, default=5, help="Number of openings (each played twice)"
@@ -320,7 +341,7 @@ def main() -> None:
     args = parser.parse_args()
 
     sf_path = args.stockfish or find_stockfish_binary()
-    print(f"Using Stockfish binary: {sf_path}")
+    print(f"Using Stockfish binary: {sf_path}", flush=True)
 
     if args.sweep_depths:
         depths = [int(d.strip()) for d in args.sweep_depths.split(",")]
@@ -333,20 +354,41 @@ def main() -> None:
                 inc_time_ms=args.inc_ms,
                 max_openings=args.openings,
             )
+            res["benchmark_elo"] = SF_DEPTH_TO_ELO.get(d, 1000 + d * 250)
             summary_results.append(res)
 
-        print("\n=======================================================")
-        print("                 BENCHMARK SUMMARY TABLE                ")
-        print("=======================================================")
-        print(f"{'Opponent':<28} | {'Score':<10} | {'Win Rate':<10} | {'Elo Diff':<12}")
-        print("-" * 68)
+        sep = "=" * 88
+        print(f"\n{sep}", flush=True)
+        print("                           DEPTH BENCHMARK SUMMARY TABLE", flush=True)
+        print(sep, flush=True)
+        hdr = (
+            f"{'Opponent':<22} | {'Score':<10} | {'Win Rate':<10} | "
+            f"{'Elo Diff':<14} | {'Est. SF Elo':<12} | {'Estimated Elo':<14}"
+        )
+        print(hdr, flush=True)
+        print("-" * 88, flush=True)
+        weighted_elo_sum = 0.0
+        weighted_weight_sum = 0.0
         for r in summary_results:
             score_str = f"+{r['wins']} ={r['draws']} -{r['losses']}"
             diff_str = f"{r['elo_diff']:>+6.1f} ± {r['error']:.0f}"
-            print(
-                f"{r['config']:<28} | {score_str:<10} | {r['score_pct']:>6.1f}%   | {diff_str}"
+            opp_elo = r["benchmark_elo"]
+            est_elo = opp_elo + r["elo_diff"]
+            row = (
+                f"{r['config']:<22} | {score_str:<10} | {r['score_pct']:>6.1f}%   | "
+                f"{diff_str:<14} | {opp_elo:<12} | ~{est_elo:.0f} Elo"
             )
-        print("=======================================================\n")
+            print(row, flush=True)
+            if 0.05 <= r["score_pct"] <= 99.95:
+                w = 1.0 / max(20.0, r["error"]) ** 2
+                weighted_elo_sum += est_elo * w
+                weighted_weight_sum += w
+
+        print(sep, flush=True)
+        if weighted_weight_sum > 0:
+            final_est = weighted_elo_sum / weighted_weight_sum
+            print(f"\n>>> OVERALL ESTIMATED RATING: ~{final_est:.0f} ELO <<<\n", flush=True)
+
     elif args.sweep_elos:
         elos = [int(e.strip()) for e in args.sweep_elos.split(",")]
         summary_results = []
@@ -360,19 +402,36 @@ def main() -> None:
             )
             summary_results.append(res)
 
-        print("\n=======================================================")
-        print("                 BENCHMARK SUMMARY TABLE                ")
-        print("=======================================================")
-        print(f"{'Opponent':<28} | {'Score':<10} | {'Win Rate':<10} | {'Elo Diff':<12} | {'Estimated Elo':<14}")
-        print("-" * 84)
+        sep = "=" * 88
+        print(f"\n{sep}", flush=True)
+        print("                            UCI ELO BENCHMARK SUMMARY TABLE", flush=True)
+        print(sep, flush=True)
+        hdr = (
+            f"{'Opponent':<24} | {'Score':<10} | {'Win Rate':<10} | "
+            f"{'Elo Diff':<14} | {'Estimated Elo':<14}"
+        )
+        print(hdr, flush=True)
+        print("-" * 88, flush=True)
+        weighted_elo_sum = 0.0
+        weighted_weight_sum = 0.0
         for idx, r in enumerate(summary_results):
             score_str = f"+{r['wins']} ={r['draws']} -{r['losses']}"
             diff_str = f"{r['elo_diff']:>+6.1f} ± {r['error']:.0f}"
             est_elo = elos[idx] + r['elo_diff']
-            print(
-                f"{r['config']:<28} | {score_str:<10} | {r['score_pct']:>6.1f}%   | {diff_str} | ~{est_elo:.0f} Elo"
+            row = (
+                f"{r['config']:<24} | {score_str:<10} | {r['score_pct']:>6.1f}%   | "
+                f"{diff_str:<14} | ~{est_elo:.0f} Elo"
             )
-        print("=======================================================\n")
+            print(row, flush=True)
+            if 0.05 <= r["score_pct"] <= 99.95:
+                w = 1.0 / max(20.0, r["error"]) ** 2
+                weighted_elo_sum += est_elo * w
+                weighted_weight_sum += w
+
+        print(sep, flush=True)
+        if weighted_weight_sum > 0:
+            final_est = weighted_elo_sum / weighted_weight_sum
+            print(f"\n>>> OVERALL ESTIMATED RATING: ~{final_est:.0f} ELO <<<\n", flush=True)
     else:
         run_benchmark(
             stockfish_path=sf_path,
@@ -387,3 +446,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

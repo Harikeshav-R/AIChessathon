@@ -18,7 +18,6 @@ from engine.defs import (
     PHASE_BOUND,
     PHASE_ENDGAME,
     PHASE_MIDDLEGAME,
-    PHASE_SACRIFICE,
     SCORE_LOST,
     SCORE_TB_WIN,
     SCORE_WIN,
@@ -383,15 +382,6 @@ class EngineSearch:
 
             stability = min(8, stability + 1) if best_move == prev_best_move else 0
 
-            # 3-Net Phase Switch at Depth >= 6
-            if depth >= 6 and total_mat_fast(self.material_stack, 0) >= PHASE_BOUND:
-                if score < -20:
-                    self.phase = PHASE_ENDGAME
-                elif score > 400:
-                    self.phase = PHASE_SACRIFICE
-                else:
-                    self.phase = PHASE_MIDDLEGAME
-                self.phase_stack[0] = self.phase
 
             prev_best_move = best_move
             prev_score = score

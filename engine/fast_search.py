@@ -307,13 +307,7 @@ def eval_position_fast(
         them = white_acc_stack[ply]
 
     raw_eval = screlu_flatten(us, them, output_weights[net_idx], output_biases[net_idx])
-
-    mat = total_mat_fast(material_stack, ply)
-    multiplier = (750.0 + float(mat) / 25.0) / 1024.0
-    if mat < 4000:
-        multiplier -= 0.1
-
-    adjusted = int(raw_eval * multiplier)
+    adjusted = int(raw_eval)
 
     p_idx = int(pawn_stack[ply] & np.uint64(16383))
     corr = int(pawn_corr_hist[color, p_idx])
