@@ -67,6 +67,7 @@ class EngineSearch:
         self.pawn_stack = np.zeros(128, dtype=np.uint64)
         self.non_pawn_stack = np.zeros((128, 2), dtype=np.uint64)
         self.phase_stack = np.zeros(128, dtype=np.int32)
+        self.eval_stack = np.zeros(128, dtype=np.int16)
 
         self.white_acc_stack = np.zeros((128, 1024), dtype=np.int16)
         self.black_acc_stack = np.zeros((128, 1024), dtype=np.int16)
@@ -77,11 +78,12 @@ class EngineSearch:
         # Search Tables
         self.pv_table = np.zeros((128, 128), dtype=np.uint16)
         self.pv_length = np.zeros(128, dtype=np.int32)
+        self.prev_moves = np.zeros(128, dtype=np.uint16)
         self.killers = np.zeros((128, 2), dtype=np.uint16)
         self.main_history = np.zeros((2, 64, 64), dtype=np.int16)
         self.cap_history = np.zeros((14, 64), dtype=np.int16)
-        self.cont_history_1 = np.zeros((14, 64), dtype=np.int16)
-        self.cont_history_2 = np.zeros((14, 64), dtype=np.int16)
+        self.cont_history_1 = np.zeros((14, 64, 14, 64), dtype=np.int16)
+        self.cont_history_2 = np.zeros((14, 64, 14, 64), dtype=np.int16)
         self.counter_moves = np.zeros((2, 64, 64), dtype=np.uint16)
         self.pawn_corr_hist = np.zeros((2, 16384), dtype=np.int16)
         self.non_pawn_corr_hist = np.zeros((2, 2, 16384), dtype=np.int16)
@@ -96,6 +98,10 @@ class EngineSearch:
         self.tt_depths = np.zeros(TT_SIZE, dtype=np.uint8)
         self.tt_bounds = np.zeros(TT_SIZE, dtype=np.uint8)
         self.tt_ages = np.zeros(TT_SIZE, dtype=np.uint8)
+
+        # Game History & Repetition
+        self.game_history = np.zeros(1024, dtype=np.uint64)
+        self.game_history_len: int = 0
 
         # Search Controls
         self.nodes_count = np.zeros(1, dtype=np.int64)
@@ -143,6 +149,8 @@ class EngineSearch:
             else PHASE_MIDDLEGAME
         )
         self.phase_stack[0] = self.phase
+        self.eval_stack.fill(0)
+        self.prev_moves.fill(0)
 
         # Refresh NNUE accumulator at ply 0
         net_idx = phase_to_index(self.phase)
@@ -165,9 +173,22 @@ class EngineSearch:
 
         return pos
 
-    def search_root(self, fen: str, time_left_ms: int) -> tuple[str, str | None]:
+    def search_root(
+            self,
+            fen: str,
+            time_left_ms: int,
+            game_history: np.ndarray | None = None,
+            game_history_len: int = 0,
+    ) -> tuple[str, str | None]:
         """Runs iterative deepening search using Numba JIT fast search kernel."""
         pos = self.setup_root_position(fen)
+
+        if game_history is not None:
+            self.game_history = game_history
+            self.game_history_len = game_history_len
+        else:
+            self.game_history[0] = pos.zobrist_key
+            self.game_history_len = 1
 
         self.start_time = time.perf_counter()
         soft_limit, hard_limit = self.tm.allocate_time(time_left_ms, inc_ms=100)
@@ -190,13 +211,13 @@ class EngineSearch:
         stability = 0
         prev_score = 0
         predicted_reply: str | None = None
-        est_nps = 300000.0
+        est_nps = 450000.0
 
         # Iterative Deepening
         for depth in range(1, MAX_SEARCH_DEPTH):
             self.current_iter = depth
 
-            # Hard node limit based on dynamic NPS and remaining time budget
+            # Dynamic node limit based on remaining time budget
             elapsed_ms = (time.perf_counter() - self.start_time) * 1000.0
             if elapsed_ms > 10.0 and self.nodes_count[0] > 1000:
                 est_nps = (float(self.nodes_count[0]) / elapsed_ms) * 1000.0
@@ -228,12 +249,14 @@ class EngineSearch:
                     self.pawn_stack,
                     self.non_pawn_stack,
                     self.phase_stack,
+                    self.eval_stack,
                     self.white_acc_stack,
                     self.black_acc_stack,
                     self.move_stack,
                     self.score_stack,
                     self.pv_table,
                     self.pv_length,
+                    self.prev_moves,
                     self.killers,
                     self.main_history,
                     self.cap_history,
@@ -254,6 +277,8 @@ class EngineSearch:
                     self.tt_ages,
                     self.tt_mask,
                     self.age,
+                    self.game_history,
+                    self.game_history_len,
                     self.nodes_count,
                     self.stop_flag,
                     node_limit,
@@ -283,12 +308,14 @@ class EngineSearch:
                         self.pawn_stack,
                         self.non_pawn_stack,
                         self.phase_stack,
+                        self.eval_stack,
                         self.white_acc_stack,
                         self.black_acc_stack,
                         self.move_stack,
                         self.score_stack,
                         self.pv_table,
                         self.pv_length,
+                        self.prev_moves,
                         self.killers,
                         self.main_history,
                         self.cap_history,
@@ -309,6 +336,8 @@ class EngineSearch:
                         self.tt_ages,
                         self.tt_mask,
                         self.age,
+                        self.game_history,
+                        self.game_history_len,
                         self.nodes_count,
                         self.stop_flag,
                         node_limit,
@@ -336,12 +365,14 @@ class EngineSearch:
                     self.pawn_stack,
                     self.non_pawn_stack,
                     self.phase_stack,
+                    self.eval_stack,
                     self.white_acc_stack,
                     self.black_acc_stack,
                     self.move_stack,
                     self.score_stack,
                     self.pv_table,
                     self.pv_length,
+                    self.prev_moves,
                     self.killers,
                     self.main_history,
                     self.cap_history,
@@ -362,6 +393,8 @@ class EngineSearch:
                     self.tt_ages,
                     self.tt_mask,
                     self.age,
+                    self.game_history,
+                    self.game_history_len,
                     self.nodes_count,
                     self.stop_flag,
                     node_limit,
@@ -381,14 +414,21 @@ class EngineSearch:
                         predicted_reply = move_to_uci(reply_m)
 
             stability = min(8, stability + 1) if best_move == prev_best_move else 0
-
-
             prev_best_move = best_move
             prev_score = score
 
-            # Dynamic time check
+            # Dynamic time check using stability and score fluctuations
             elapsed = (time.perf_counter() - self.start_time) * 1000.0
-            if elapsed >= self.soft_time_limit * 0.58 or abs(score) >= SCORE_TB_WIN:
+            adjusted_soft = self.tm.adjust_soft_limit(
+                int(self.soft_time_limit),
+                int(self.hard_time_limit),
+                int(self.nodes_count[0] * 0.6),
+                int(self.nodes_count[0]),
+                stability,
+                score,
+                prev_score,
+            )
+            if elapsed >= adjusted_soft * 0.75 or abs(score) >= SCORE_TB_WIN:
                 break
 
         return move_to_uci(best_move), predicted_reply
@@ -430,12 +470,14 @@ class EngineSearch:
                 self.pawn_stack,
                 self.non_pawn_stack,
                 self.phase_stack,
+                self.eval_stack,
                 self.white_acc_stack,
                 self.black_acc_stack,
                 self.move_stack,
                 self.score_stack,
                 self.pv_table,
                 self.pv_length,
+                self.prev_moves,
                 self.killers,
                 self.main_history,
                 self.cap_history,
@@ -456,6 +498,8 @@ class EngineSearch:
                 self.tt_ages,
                 self.tt_mask,
                 self.age,
+                self.game_history,
+                self.game_history_len,
                 self.nodes_count,
                 self.stop_flag,
                 node_limit,
