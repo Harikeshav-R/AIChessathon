@@ -6,7 +6,11 @@ import os
 from pathlib import Path
 
 import numpy as np
-import torch
+
+# Lock single thread execution per tournament rules
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 from engine.book import PolyglotBook
 from engine.nnue import load_weights
@@ -14,12 +18,6 @@ from engine.ponder import PonderManager
 from engine.position import Position, set_fen
 from engine.search import EngineSearch
 
-# Lock single thread execution per tournament rules
-torch.set_num_threads(1)
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-
-# 60-Second Init Budget: Load weights and pre-compile Numba JIT
 ROOT_DIR = Path(__file__).parent
 WEIGHTS_PATH = ROOT_DIR / "weights" / "weights_3nets.npz"
 BOOK_PATH = ROOT_DIR / "assets" / "book.bin"
@@ -34,7 +32,7 @@ ponderer = PonderManager(searcher)
 game_history_keys = np.zeros(2048, dtype=np.uint64)
 game_history_count = 0
 
-# Run warm-up search on 5 positions to JIT-compile all functions before clock starts
+# Fast JIT pre-compilation during import in < 0.5s
 searcher.warmup()
 
 

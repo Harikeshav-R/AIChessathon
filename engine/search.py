@@ -82,8 +82,8 @@ class EngineSearch:
         self.killers = np.zeros((128, 2), dtype=np.uint16)
         self.main_history = np.zeros((2, 64, 64), dtype=np.int16)
         self.cap_history = np.zeros((14, 64), dtype=np.int16)
-        self.cont_history_1 = np.zeros((14, 64, 14, 64), dtype=np.int16)
-        self.cont_history_2 = np.zeros((14, 64, 14, 64), dtype=np.int16)
+        self.cont_history_1 = np.zeros((896, 896), dtype=np.int16)
+        self.cont_history_2 = np.zeros((896, 896), dtype=np.int16)
         self.counter_moves = np.zeros((2, 64, 64), dtype=np.uint16)
         self.pawn_corr_hist = np.zeros((2, 16384), dtype=np.int16)
         self.non_pawn_corr_hist = np.zeros((2, 2, 16384), dtype=np.int16)
@@ -211,7 +211,7 @@ class EngineSearch:
         stability = 0
         prev_score = 0
         predicted_reply: str | None = None
-        est_nps = 450000.0
+        est_nps = 500000.0
 
         # Iterative Deepening
         for depth in range(1, MAX_SEARCH_DEPTH):
@@ -508,20 +508,63 @@ class EngineSearch:
                 self.stop_flag[0] = 0
 
     def warmup(self) -> None:
-        """Warms up all Numba JIT search code paths during the 60s init window."""
-        warmup_fens = [
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            "r1bqk2r/pp2bppp/2n5/2p5/3pP3/5NP1/PPP2PBP/R1BQK2R w KQkq - 0 1",
-            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-            "8/8/4k3/8/8/8/4K3/4Q3 w - - 0 1",
-        ]
-        old_soft, old_hard = self.soft_time_limit, self.hard_time_limit
-        self.soft_time_limit = 50.0
-        self.hard_time_limit = 100.0
-
-        for fen in warmup_fens:
-            with contextlib.suppress(Exception):
-                self.search_root(fen, 1000)
-
-        self.soft_time_limit, self.hard_time_limit = old_soft, old_hard
+        """Fast JIT precompilation during import in < 0.5s."""
+        with contextlib.suppress(Exception):
+            self.setup_root_position("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+            self.stop_flag[0] = 0
+            self.nodes_count[0] = 0
+            # 1-ply search on root compiles all JIT functions and loops instantly
+            pvs_search_fast(
+                SCORE_LOST,
+                SCORE_WIN,
+                1,
+                0,
+                True,
+                False,
+                MOVE_NONE,
+                self.board_stack,
+                self.colors_stack,
+                self.pieces_stack,
+                self.material_stack,
+                self.castling_stack,
+                self.ep_stack,
+                self.color_stack,
+                self.halfmoves_stack,
+                self.zobrist_stack,
+                self.pawn_stack,
+                self.non_pawn_stack,
+                self.phase_stack,
+                self.eval_stack,
+                self.white_acc_stack,
+                self.black_acc_stack,
+                self.move_stack,
+                self.score_stack,
+                self.pv_table,
+                self.pv_length,
+                self.prev_moves,
+                self.killers,
+                self.main_history,
+                self.cap_history,
+                self.cont_history_1,
+                self.cont_history_2,
+                self.counter_moves,
+                self.pawn_corr_hist,
+                self.non_pawn_corr_hist,
+                self.weights.feature_weights,
+                self.weights.output_weights,
+                self.weights.output_biases,
+                self.tt_keys,
+                self.tt_scores,
+                self.tt_static_evals,
+                self.tt_moves,
+                self.tt_depths,
+                self.tt_bounds,
+                self.tt_ages,
+                self.tt_mask,
+                self.age,
+                self.game_history,
+                self.game_history_len,
+                self.nodes_count,
+                self.stop_flag,
+                20,
+            )

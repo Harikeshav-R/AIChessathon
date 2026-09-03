@@ -90,12 +90,8 @@ from engine.params import (
     NMP_DEPTH_DIV,
     NMP_EVAL_DIV,
     NMP_MIN_DEPTH,
-    PROBCUT_MARGIN,
     RFP_MARGIN,
     RFP_MAX_DEPTH,
-    SE_DEPTH,
-    SE_DOUBLE_EXT_MARGIN,
-    SE_TRIPLE_EXT_MARGIN,
     SEE_PRUNING_DEPTH,
     SEE_QUIET_MARGIN,
 )
@@ -861,6 +857,156 @@ def qsearch_fast(
 
 
 @njit(fastmath=True, nogil=True)
+def score_pvs_moves(
+        n_moves: int,
+        ply: int,
+        color: int,
+        tt_move: int,
+        k1: int,
+        k2: int,
+        cm: int,
+        c1_prev_idx: int,
+        c2_prev_idx: int,
+        prev_piece: int,
+        prev2_piece: int,
+        board_stack: np.ndarray,
+        colors_stack: np.ndarray,
+        pieces_stack: np.ndarray,
+        move_stack: np.ndarray,
+        score_stack: np.ndarray,
+        main_history: np.ndarray,
+        cap_history: np.ndarray,
+        cont_history_1: np.ndarray,
+        cont_history_2: np.ndarray,
+) -> None:
+    for i in range(n_moves):
+        m = int(move_stack[ply, i])
+        f = extract_from(m)
+        t = extract_to(m)
+        f_piece = int(board_stack[ply, f])
+        t_piece = int(board_stack[ply, t])
+        is_capture = (t_piece != 0) or (extract_type(m) == MOVE_EN_PASSANT)
+
+        if m == tt_move:
+            score_stack[ply, i] = 1000000000
+        elif extract_type(m) == MOVE_PROMOTION and extract_promo(m) == PROMO_QUEEN:
+            score_stack[ply, i] = 900000000
+        elif is_capture:
+            att_val = get_see_value(get_piece_type(f_piece))
+            vic_val = get_see_value(get_piece_type(t_piece)) if t_piece != 0 else att_val
+            cap_h = int(cap_history[f_piece, t])
+            if see_fast(board_stack[ply], colors_stack[ply], pieces_stack[ply], m, 0):
+                score_stack[ply, i] = 800000000 + vic_val * 100 - att_val + cap_h
+            else:
+                score_stack[ply, i] = -100000000 + vic_val * 100 - att_val + cap_h
+        elif m == k1:
+            score_stack[ply, i] = 700000000
+        elif m == k2:
+            score_stack[ply, i] = 690000000
+        elif m == cm:
+            score_stack[ply, i] = 680000000
+        else:
+            h = int(main_history[color, f, t])
+            curr_idx = (f_piece << 6) | t
+            if prev_piece != 0:
+                h += int(cont_history_1[c1_prev_idx, curr_idx])
+            if prev2_piece != 0:
+                h += int(cont_history_2[c2_prev_idx, curr_idx])
+            score_stack[ply, i] = h
+
+
+@njit(fastmath=True, nogil=True)
+def update_cutoff_history(
+        m: int,
+        depth: int,
+        ply: int,
+        color: int,
+        is_quiet: bool,
+        prev_piece: int,
+        prev_to: int,
+        prev2_piece: int,
+        prev2_to: int,
+        board_stack: np.ndarray,
+        main_history: np.ndarray,
+        cap_history: np.ndarray,
+        cont_history_1: np.ndarray,
+        cont_history_2: np.ndarray,
+        killers: np.ndarray,
+        counter_moves: np.ndarray,
+) -> None:
+    f = extract_from(m)
+    t = extract_to(m)
+    f_piece = int(board_stack[ply, f])
+    bonus = min(HIST_MAX, HIST_BONUS * depth)
+
+    if is_quiet:
+        if killers[ply, 0] != m:
+            killers[ply, 1] = killers[ply, 0]
+            killers[ply, 0] = np.uint16(m)
+
+        # Gravity-damped Main History update
+        cur_h = int(main_history[color, f, t])
+        main_history[color, f, t] = np.int16(cur_h + bonus - (cur_h * abs(bonus)) // 16384)
+
+        # 1-Ply Continuation History update
+        curr_idx = (f_piece << 6) | t
+        if prev_piece != 0:
+            c1_prev = (prev_piece << 6) | prev_to
+            cur_c1 = int(cont_history_1[c1_prev, curr_idx])
+            cont_history_1[c1_prev, curr_idx] = np.int16(cur_c1 + bonus - (cur_c1 * abs(bonus)) // 16384)
+
+        # 2-Ply Continuation History update
+        if prev2_piece != 0:
+            c2_prev = (prev2_piece << 6) | prev2_to
+            cur_c2 = int(cont_history_2[c2_prev, curr_idx])
+            cont_history_2[c2_prev, curr_idx] = np.int16(cur_c2 + bonus - (cur_c2 * abs(bonus)) // 16384)
+
+        counter_moves[color, f, t] = np.uint16(m)
+    else:
+        cur_cap = int(cap_history[f_piece, t])
+        cap_history[f_piece, t] = np.int16(cur_cap + bonus - (cur_cap * abs(bonus)) // 16384)
+
+
+@njit(fastmath=True, nogil=True)
+def apply_history_malus(
+        searched_quiets: np.ndarray,
+        num_quiets: int,
+        depth: int,
+        ply: int,
+        color: int,
+        prev_piece: int,
+        prev_to: int,
+        prev2_piece: int,
+        prev2_to: int,
+        board_stack: np.ndarray,
+        main_history: np.ndarray,
+        cont_history_1: np.ndarray,
+        cont_history_2: np.ndarray,
+) -> None:
+    bonus = min(HIST_MAX, HIST_BONUS * depth)
+    c1_prev = (prev_piece << 6) | prev_to if prev_piece != 0 else 0
+    c2_prev = (prev2_piece << 6) | prev2_to if prev2_piece != 0 else 0
+
+    for q_idx in range(num_quiets - 1):
+        prev_q = int(searched_quiets[q_idx])
+        pf = extract_from(prev_q)
+        pt = extract_to(prev_q)
+        pp = int(board_stack[ply, pf])
+        p_curr_idx = (pp << 6) | pt
+
+        qh = int(main_history[color, pf, pt])
+        main_history[color, pf, pt] = np.int16(qh - bonus - (qh * abs(bonus)) // 16384)
+
+        if prev_piece != 0:
+            qc1 = int(cont_history_1[c1_prev, p_curr_idx])
+            cont_history_1[c1_prev, p_curr_idx] = np.int16(qc1 - bonus - (qc1 * abs(bonus)) // 16384)
+
+        if prev2_piece != 0:
+            qc2 = int(cont_history_2[c2_prev, p_curr_idx])
+            cont_history_2[c2_prev, p_curr_idx] = np.int16(qc2 - bonus - (qc2 * abs(bonus)) // 16384)
+
+
+@njit(fastmath=True, nogil=True)
 def pvs_search_fast(
         alpha: int,
         beta: int,
@@ -1062,54 +1208,11 @@ def pvs_search_fast(
         if null_score >= beta:
             return beta if null_score >= SCORE_WIN else null_score
 
-    # 6. ProbCut (Probability Cutoff on Captures)
-    if (
-            depth >= 5
-            and not is_pv
-            and not in_chk
-            and abs(beta) < SCORE_WIN
-            and excluded_move == MOVE_NONE
-            and static_eval >= beta + PROBCUT_MARGIN - 150
-    ):
-        probcut_beta = beta + PROBCUT_MARGIN
-        n_prob_moves = generate_moves_fast(
-            board_stack[ply], colors_stack[ply], pieces_stack[ply],
-            castling_stack[ply], int(ep_stack[ply]), color,
-            move_stack[ply], 0, 1,  # Captures only
-        )
-        for p_idx in range(n_prob_moves):
-            pm = int(move_stack[ply, p_idx])
-            if not see_fast(board_stack[ply], colors_stack[ply], pieces_stack[ply], pm, 0):
-                continue
-            next_ply = ply + 1
-            make_move_fast(
-                ply, next_ply, pm,
-                board_stack, colors_stack, pieces_stack, material_stack, castling_stack,
-                ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
-                non_pawn_stack, phase_stack, white_acc_stack, black_acc_stack, feature_weights,
-            )
-            if is_in_check_fast(colors_stack[next_ply], pieces_stack[next_ply], color):
-                continue
-            p_score = -pvs_search_fast(
-                -probcut_beta, -probcut_beta + 1, depth - 4, next_ply, False, True, MOVE_NONE,
-                board_stack, colors_stack, pieces_stack, material_stack, castling_stack,
-                ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
-                non_pawn_stack, phase_stack, eval_stack, white_acc_stack, black_acc_stack,
-                move_stack, score_stack, pv_table, pv_length, prev_moves, killers,
-                main_history, cap_history, cont_history_1, cont_history_2, counter_moves,
-                pawn_corr_hist, non_pawn_corr_hist,
-                feature_weights, output_weights, output_biases,
-                tt_keys, tt_scores, tt_static_evals, tt_moves, tt_depths, tt_bounds, tt_ages,
-                tt_mask, current_age, game_history, game_history_len, nodes_count, stop_flag, node_limit,
-            )
-            if p_score >= probcut_beta:
-                return beta
-
     # Internal Iterative Reductions (IIR)
     if depth >= IIR_MIN_DEPTH and tt_move == MOVE_NONE and not in_chk:
         depth -= 1
 
-    # 7. Generate & Score Moves
+    # 6. Generate & Score Moves
     n_moves = generate_moves_fast(
         board_stack[ply], colors_stack[ply], pieces_stack[ply],
         castling_stack[ply], int(ep_stack[ply]), color,
@@ -1123,44 +1226,19 @@ def pvs_search_fast(
     prev_m = int(prev_moves[ply - 1]) if ply >= 1 else MOVE_NONE
     prev_piece = int(board_stack[ply - 1, extract_from(prev_m)]) if prev_m != MOVE_NONE else 0
     prev_to = extract_to(prev_m) if prev_m != MOVE_NONE else 0
+    c1_prev_idx = (prev_piece << 6) | prev_to
 
     prev2_m = int(prev_moves[ply - 2]) if ply >= 2 else MOVE_NONE
     prev2_piece = int(board_stack[ply - 2, extract_from(prev2_m)]) if prev2_m != MOVE_NONE else 0
     prev2_to = extract_to(prev2_m) if prev2_m != MOVE_NONE else 0
+    c2_prev_idx = (prev2_piece << 6) | prev2_to
 
-    for i in range(n_moves):
-        m = int(move_stack[ply, i])
-        f = extract_from(m)
-        t = extract_to(m)
-        f_piece = int(board_stack[ply, f])
-        t_piece = int(board_stack[ply, t])
-        is_capture = (t_piece != 0) or (extract_type(m) == MOVE_EN_PASSANT)
-
-        if m == tt_move:
-            score_stack[ply, i] = 1000000000
-        elif extract_type(m) == MOVE_PROMOTION and extract_promo(m) == PROMO_QUEEN:
-            score_stack[ply, i] = 900000000
-        elif is_capture:
-            att_val = get_see_value(get_piece_type(f_piece))
-            vic_val = get_see_value(get_piece_type(t_piece)) if t_piece != 0 else att_val
-            cap_h = int(cap_history[f_piece, t])
-            if see_fast(board_stack[ply], colors_stack[ply], pieces_stack[ply], m, 0):
-                score_stack[ply, i] = 800000000 + vic_val * 100 - att_val + cap_h
-            else:
-                score_stack[ply, i] = -100000000 + vic_val * 100 - att_val + cap_h
-        elif m == k1:
-            score_stack[ply, i] = 700000000
-        elif m == k2:
-            score_stack[ply, i] = 690000000
-        elif m == cm:
-            score_stack[ply, i] = 680000000
-        else:
-            h = int(main_history[color, f, t])
-            if prev_piece != 0:
-                h += int(cont_history_1[prev_piece, prev_to, f_piece, t])
-            if prev2_piece != 0:
-                h += int(cont_history_2[prev2_piece, prev2_to, f_piece, t])
-            score_stack[ply, i] = h
+    score_pvs_moves(
+        n_moves, ply, color, tt_move, k1, k2, cm,
+        c1_prev_idx, c2_prev_idx, prev_piece, prev2_piece,
+        board_stack, colors_stack, pieces_stack, move_stack, score_stack,
+        main_history, cap_history, cont_history_1, cont_history_2,
+    )
 
     best_score = SCORE_NONE
     best_move = MOVE_NONE
@@ -1234,38 +1312,7 @@ def pvs_search_fast(
                 searched_quiets[num_searched_quiets] = np.uint16(m)
                 num_searched_quiets += 1
 
-        # 8. Singular Extensions
-        extension = 0
-        if (
-                depth >= SE_DEPTH
-                and m == tt_move
-                and tt_hit
-                and tt_bound in (ENTRY_EXACT, ENTRY_LBOUND)
-                and abs(tt_score) < SCORE_WIN
-                and excluded_move == MOVE_NONE
-        ):
-            se_beta = tt_score - depth * 2
-            se_score = pvs_search_fast(
-                se_beta - 1, se_beta, (depth - 1) // 2, ply, False, cutnode, tt_move,
-                board_stack, colors_stack, pieces_stack, material_stack, castling_stack,
-                ep_stack, color_stack, halfmoves_stack, zobrist_stack, pawn_stack,
-                non_pawn_stack, phase_stack, eval_stack, white_acc_stack, black_acc_stack,
-                move_stack, score_stack, pv_table, pv_length, prev_moves, killers,
-                main_history, cap_history, cont_history_1, cont_history_2, counter_moves,
-                pawn_corr_hist, non_pawn_corr_hist,
-                feature_weights, output_weights, output_biases,
-                tt_keys, tt_scores, tt_static_evals, tt_moves, tt_depths, tt_bounds, tt_ages,
-                tt_mask, current_age, game_history, game_history_len, nodes_count, stop_flag, node_limit,
-            )
-            if se_score < se_beta:
-                if se_score < se_beta - SE_TRIPLE_EXT_MARGIN:
-                    extension = 3
-                elif se_score < se_beta - SE_DOUBLE_EXT_MARGIN:
-                    extension = 2
-                else:
-                    extension = 1
-
-        # 9. Late Move Reductions (LMR) with History & Improving
+        # 7. Late Move Reductions (LMR) with History & Improving
         reduction = 0
         if depth >= LMR_MIN_DEPTH and moves_played > 1 and is_quiet:
             reduction = int(LMR_TABLE[min(127, depth), min(255, moves_played)])
@@ -1275,7 +1322,7 @@ def pvs_search_fast(
             fp = int(board_stack[ply, f_sq])
             h_val = int(main_history[color, f_sq, t_sq])
             if prev_piece != 0:
-                h_val += int(cont_history_1[prev_piece, prev_to, fp, t_sq])
+                h_val += int(cont_history_1[c1_prev_idx, (fp << 6) | t_sq])
             reduction -= h_val // 8192
 
             if not is_pv:
@@ -1286,7 +1333,7 @@ def pvs_search_fast(
                 reduction += 1
             reduction = max(0, min(depth - 1, reduction))
 
-        new_depth = depth - 1 + extension
+        new_depth = depth - 1
 
         # PVS search
         if moves_played == 1:
@@ -1357,64 +1404,18 @@ def pvs_search_fast(
                 pv_length[ply] = pv_length[ply + 1]
 
                 if score >= beta:
+                    update_cutoff_history(
+                        m, depth, ply, color, is_quiet,
+                        prev_piece, prev_to, prev2_piece, prev2_to,
+                        board_stack, main_history, cap_history,
+                        cont_history_1, cont_history_2, killers, counter_moves,
+                    )
                     if is_quiet:
-                        if killers[ply, 0] != m:
-                            killers[ply, 1] = killers[ply, 0]
-                            killers[ply, 0] = np.uint16(m)
-                        f = extract_from(m)
-                        t = extract_to(m)
-                        f_piece = int(board_stack[ply, f])
-                        bonus = min(HIST_MAX, HIST_BONUS * depth)
-
-                        # Gravity-damped Main History update
-                        cur_h = int(main_history[color, f, t])
-                        main_history[color, f, t] = np.int16(cur_h + bonus - (cur_h * abs(bonus)) // 16384)
-
-                        # 1-Ply Continuation History update
-                        if prev_piece != 0:
-                            cur_c1 = int(cont_history_1[prev_piece, prev_to, f_piece, t])
-                            cont_history_1[prev_piece, prev_to, f_piece, t] = np.int16(
-                                cur_c1 + bonus - (cur_c1 * abs(bonus)) // 16384
-                            )
-
-                        # 2-Ply Continuation History update
-                        if prev2_piece != 0:
-                            cur_c2 = int(cont_history_2[prev2_piece, prev2_to, f_piece, t])
-                            cont_history_2[prev2_piece, prev2_to, f_piece, t] = np.int16(
-                                cur_c2 + bonus - (cur_c2 * abs(bonus)) // 16384
-                            )
-
-                        counter_moves[color, f, t] = np.uint16(m)
-
-                        # History Malus on previously searched quiets that failed low
-                        for q_idx in range(num_searched_quiets - 1):
-                            prev_q = int(searched_quiets[q_idx])
-                            pf = extract_from(prev_q)
-                            pt = extract_to(prev_q)
-                            pp = int(board_stack[ply, pf])
-
-                            qh = int(main_history[color, pf, pt])
-                            main_history[color, pf, pt] = np.int16(qh - bonus - (qh * abs(bonus)) // 16384)
-
-                            if prev_piece != 0:
-                                qc1 = int(cont_history_1[prev_piece, prev_to, pp, pt])
-                                cont_history_1[prev_piece, prev_to, pp, pt] = np.int16(
-                                    qc1 - bonus - (qc1 * abs(bonus)) // 16384
-                                )
-
-                            if prev2_piece != 0:
-                                qc2 = int(cont_history_2[prev2_piece, prev2_to, pp, pt])
-                                cont_history_2[prev2_piece, prev2_to, pp, pt] = np.int16(
-                                    qc2 - bonus - (qc2 * abs(bonus)) // 16384
-                                )
-                    else:
-                        # Capture history update on beta cutoff
-                        f = extract_from(m)
-                        t = extract_to(m)
-                        f_piece = int(board_stack[ply, f])
-                        bonus = min(HIST_MAX, HIST_BONUS * depth)
-                        cur_cap = int(cap_history[f_piece, t])
-                        cap_history[f_piece, t] = np.int16(cur_cap + bonus - (cur_cap * abs(bonus)) // 16384)
+                        apply_history_malus(
+                            searched_quiets, num_searched_quiets, depth, ply, color,
+                            prev_piece, prev_to, prev2_piece, prev2_to,
+                            board_stack, main_history, cont_history_1, cont_history_2,
+                        )
                     break
 
     if moves_played == 0:
@@ -1433,7 +1434,7 @@ def pvs_search_fast(
     elif stored_score <= SCORE_LOST:
         stored_score -= ply
 
-    # Age-aware TT replacement: replace if empty, different key, older generation, or deeper
+    # Age-aware TT replacement
     is_stale = (tt_ages[tt_idx] != current_age)
     if tt_keys[tt_idx] != key_32 or is_stale or depth >= int(tt_depths[tt_idx]):
         tt_keys[tt_idx] = key_32
